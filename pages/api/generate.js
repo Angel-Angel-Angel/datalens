@@ -1,72 +1,134 @@
+
 import OpenAI from "openai";
 
 const openai = new OpenAI();
 
-let chatHistory = [{ role: "system", content: "You are a helpful assistant." }];
+const SYSTEM_PROMPT = {
+  role: "system",
+  content:
+    "You are Angel Bello's Joke Lab assistant. Your main job is to create original, funny, clean jokes. You can make programming jokes, school jokes, science jokes, dad jokes, animal jokes, and general humor. Keep jokes friendly and appropriate for a general audience. If someone asks for an explanation or another topic, be helpful and conversational. Avoid offensive humor.",
+};
+
+// Generate a prompt that asks the AI to write a joke.
+function generatePrompt(animal) {
+  return `Write a funny, original, family-friendly joke about ${animal}. Include a setup and a punchline.`;
+}
+
+let chatHistory = [SYSTEM_PROMPT];
 
 export default async function handler(req, res) {
   const { method } = req;
 
-  switch (method) {
-    case "POST":
-      if (req.query.endpoint === "chat") {
-        // Handle POST to /api/generate?endpoint=chat
-        const content = req.body.message;
-        chatHistory.push({ role: "user", content: content });
-        res.status(200).json({ success: true });
-      } else if (req.query.endpoint === "reset") {
-        // Handle POST to /api/generate?endpoint=reset
-        chatHistory = [
-          { role: "system", content: "You are a helpful assistant." },
-        ];
-        res.status(200).json({ success: true });
-      } else {
-        res.status(404).json({ error: "Not Found" });
+  if (method === "POST") {
+    if (req.query.endpoint === "chat") {
+      const content = req.body?.message;
+
+      if (typeof content !== "string" || !content.trim()) {
+        return res.status(400).json({
+          success: false,
+          error: "Please enter a message.",
+        });
       }
-      break;
-    case "GET":
-      if (req.query.endpoint === "history") {
-        res.status(200).json(chatHistory);
-      } else if (req.query.endpoint === "stream") {
-        // Set headers for Server-Sent Events
-        res.setHeader("Content-Type", "text/event-stream");
-        res.setHeader("Cache-Control", "no-cache");
-        res.setHeader("Connection", "keep-alive");
 
-        try {
-          const stream = await openai.beta.chat.completions.stream({
-            model: "gpt-3.5-turbo",
-            messages: chatHistory,
-            stream: true,
-          });
+      // If the user asks for a joke, use generatePrompt().
+      const userMessage = content.trim();
+      const lowerMessage = userMessage.toLowerCase();
 
-          for await (const chunk of stream) {
-            const message = chunk.choices[0]?.delta?.content || "";
-            res.write(`data: ${JSON.stringify(message)}\n\n`);
+      const jokeMatch = lowerMessage.match(
+        /^(?:tell me|write|generate|give me|make me|make)\s+(?:a|an)?\s*(?:funny\s+)?joke(?:\s+about\s+(.+))?$/
+      );
+
+      const finalMessage = jokeMatch
+        ? generatePrompt(jokeMatch[1] || "a random topic")
+        : userMessage;
+
+      chatHistory.push({
+        role: "user",
+        content: finalMessage,
+      });
+
+      return res.status(200).json({ success: true });
+    }
+
+    if (req.query.endpoint === "reset") {
+      chatHistory = [SYSTEM_PROMPT];
+
+      return res.status(200).json({ success: true });
+    }
+
+    return res.status(404).json({
+      error: "Endpoint not found.",
+    });
+  }
+
+  if (method === "GET") {
+    if (req.query.endpoint === "history") {
+      return res.status(200).json(chatHistory);
+    }
+
+    if (req.query.endpoint === "stream") {
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache, no-transform");
+      res.setHeader("Connection", "keep-alive");
+      res.flushHeaders?.();
+
+      try {
+        const stream = await openai.chat.completions.create({
+          model: process.env.OPENAI_MODEL || "gpt-5.2",
+          messages: chatHistory,
+          stream: true,
+        });
+
+        let assistantReply = "";
+
+        for await (const chunk of stream) {
+          if (res.destroyed) return;
+
+          const text = chunk.choices[0]?.delta?.content || "";
+
+          if (text) {
+            assistantReply += text;
+            res.write(`data: ${JSON.stringify(text)}\n\n`);
           }
-
-          // After the stream ends, get the final chat completion
-          const chatCompletion = await stream.finalChatCompletion();
-        } catch (error) {
-          res.write(
-            "event: error\ndata: " +
-              JSON.stringify({ message: "Stream encountered an error" }) +
-              "\n\n"
-          );
         }
 
-        // When the client closes the connection, we stop the stream
-        return new Promise((resolve) => {
-          req.on("close", () => {
-            resolve();
+        if (assistantReply) {
+          chatHistory.push({
+            role: "assistant",
+            content: assistantReply,
           });
-        });
-      } else {
-        res.status(404).json({ error: "Not Found" });
+        }
+
+        if (!res.destroyed) {
+          res.write("event: done\ndata: {}\n\n");
+          res.end();
+        }
+      } catch (error) {
+        console.error("OpenAI streaming error:", error.message);
+
+        if (!res.destroyed) {
+          res.write(
+            `event: app-error\ndata: ${JSON.stringify({
+              message:
+                "I couldn't generate a response. Check your API key, model access, and server terminal for details.",
+            })}\n\n`
+          );
+
+          res.end();
+        }
       }
-      break;
-    default:
-      res.setHeader("Allow", ["GET", "POST"]);
-      res.status(405).end(`Method ${method} Not Allowed`);
+
+      return;
+    }
+
+    return res.status(404).json({
+      error: "Endpoint not found.",
+    });
   }
+
+  res.setHeader("Allow", ["GET", "POST"]);
+
+  return res.status(405).json({
+    error: "Method not allowed.",
+  });
 }
